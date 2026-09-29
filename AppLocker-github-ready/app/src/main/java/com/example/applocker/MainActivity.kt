@@ -322,6 +322,7 @@ class MainActivity : ComponentActivity() {
         val filtered = remember(apps, query, showSystem) {
             apps.filter { (showSystem || !it.isSystem) && it.label.contains(query, ignoreCase = true) }
         }
+        var showReleaseConfirm by remember { mutableStateOf(false) }
         BackHandler(onBack = onClose)
 
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 16.dp)) {
@@ -345,17 +346,44 @@ class MainActivity : ComponentActivity() {
                 HorizontalDivider()
                 Spacer(Modifier.height(12.dp))
 
-                Text("Managed-device policy", style = MaterialTheme.typography.titleMedium)
+                Text("Office device lock", style = MaterialTheme.typography.titleMedium)
                 Text("Device admin: ${if (isAdmin) "active" else "inactive"}  |  Device owner: ${if (isOwner) "yes" else "no"}",
                     style = MaterialTheme.typography.bodySmall)
-                Text("Lock-task, package suspension and forced default-home need device-owner provisioning:\n" +
-                    "adb shell dpm set-device-owner ${ctx.packageName}/.AppDeviceAdminReceiver",
-                    style = MaterialTheme.typography.bodySmall)
+                if (!isOwner) {
+                    Text("Without device-owner status this only hides apps behind the launcher — " +
+                        "it can be undone from Settings. Provision with:\n" +
+                        "adb shell dpm set-device-owner ${ctx.packageName}/.AppDeviceAdminReceiver\n" +
+                        "on a factory-reset phone with no Google account added yet, before handing it to the employee.",
+                        style = MaterialTheme.typography.bodySmall)
+                } else {
+                    Text("Device owner is active: uninstalling this app, factory reset, safe mode, USB " +
+                        "debugging removal and adding a second user are all blocked once you apply the policy below.",
+                        style = MaterialTheme.typography.bodySmall)
+                }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = { activateDeviceAdmin() }, enabled = !isAdmin, modifier = Modifier.fillMaxWidth()) { Text("Activate device admin") }
-                Button(onClick = onApplyPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Apply policy to allowed apps") }
-                OutlinedButton(onClick = onClearPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Clear policy") }
-                OutlinedButton(onClick = onReleaseOwner, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Release device owner (testing)") }
+                Button(onClick = onApplyPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Lock device to allowed apps") }
+                OutlinedButton(onClick = onClearPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Unlock (clear policy, keep device owner)") }
+                OutlinedButton(
+                    onClick = { showReleaseConfirm = true }, enabled = isOwner,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Give up device owner permanently") }
+                if (showReleaseConfirm) {
+                    AlertDialog(
+                        onDismissRequest = { showReleaseConfirm = false },
+                        title = { Text("Give up device owner?") },
+                        text = { Text("This permanently removes every restriction above. The employee will be able to " +
+                            "uninstall the app, factory reset and bypass the lock afterward. You would need to factory " +
+                            "reset and re-provision to lock the device again. This cannot be undone from here.") },
+                        confirmButton = {
+                            TextButton(onClick = { showReleaseConfirm = false; onReleaseOwner() }) {
+                                Text("Give up device owner", color = MaterialTheme.colorScheme.error)
+                            }
+                        },
+                        dismissButton = { TextButton(onClick = { showReleaseConfirm = false }) { Text("Cancel") } }
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(12.dp))
