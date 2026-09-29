@@ -3,80 +3,85 @@ package com.example.applocker
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
-import android.content.IntentFilter
-import android.content.Intent
-import android.os.Build
 import android.os.UserManager
 
 /**
- * DevicePolicyManager helpers. Everything in apply()/clear() only works when this app is the
+ * DevicePolicyManager helpers. Everything here only works when this app is the
  * DEVICE OWNER (provisioned via `adb shell dpm set-device-owner` or QR/zero-touch enrollment).
- * A plain "device admin" cannot call these APIs.
+ *
+ * Deliberately does NOT take over the Home screen or pin tasks: the phone's normal launcher
+ * (folders, wallpaper, icon layout) never changes. Two ways to block an app:
+ *  - GREY_OUT (setPackagesSuspended): icon stays exactly where it is, greyed out, tapping fails.
+ *  - HIDE (setApplicationHidden): icon disappears from the launcher entirely, as if uninstalled.
+ *    Data is kept, and un-hiding brings it straight back.
  */
 object PolicyManager {
+
+    enum class BlockMode { GREY_OUT, HIDE }
 
     private fun dpm(ctx: Context) = ctx.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
     private fun admin(ctx: Context): ComponentName = AppDeviceAdminReceiver.component(ctx)
 
     fun isAdminActive(ctx: Context) = dpm(ctx).isAdminActive(admin(ctx))
     fun isDeviceOwner(ctx: Context) = dpm(ctx).isDeviceOwnerApp(ctx.packageName)
-    fun isLockTaskPermitted(ctx: Context) = dpm(ctx).isLockTaskPermitted(ctx.packageName)
 
-    fun apply(ctx: Context, store: SecureStore, allowed: Set<String>, allPackages: Collection<String>): Boolean {
+    fun apply(
+        ctx: Context, store: SecureStore, allowed: Set<String>,
+        allPackages: Collection<String>, mode: BlockMode
+    ): Boolean {
         if (!isDeviceOwner(ctx)) return false
         val dpm = dpm(ctx)
         val admin = admin(ctx)
 
-        // 1. Lock-task (kiosk) whitelist: these packages may run inside the locked task.
-        dpm.setLockTaskPackages(admin, (allowed + ctx.packageName).toTypedArray())
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            // Deliberately EXCLUDE HOME and OVERVIEW: pressing Home or opening Recents
-            // must do nothing while pinned, or the lock is cosmetic. Notifications, system
-            // info (clock/battery) and the power menu stay available for normal phone use.
-            dpm.setLockTaskFeatures(
-                admin,
-                DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS or
-                    DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO or
-                    DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS or
-                    DevicePolicyManager.LOCK_TASK_FEATURE_KEYGUARD
-            )
+        // Undo whatever was applied before, regardless of which mode it used, so switching
+        // between grey-out and hide never leaves a stray app stuck in the old state.
+        undoPrevious(ctx, store)
+
+        val toBlock = allPackages.filter { it !in allowed && it != ctx.packageName }
+        when (mode) {
+            BlockMode.GREY_OUT -> {
+                val failed = dpm.setPackagesSuspended(admin, toBlock.toTypedArray(), true).toSet()
+                store.suspendedPackages = toBlock.filter { it !in failed }.toSet()
+                store.hiddenPackages = emptySet()
+            }
+            BlockMode.HIDE -> {
+                val hidden = toBlock.filter { dpm.setApplicationHidden(admin, it, true) }
+                store.hiddenPackages = hidden.toSet()
+                store.suspendedPackages = emptySet()
+            }
         }
+        store.blockMode = mode.name
 
-        // 2. Suspend everything that is not allowed (greyed out, cannot be launched).
-        val previous = store.suspendedPackages
-        if (previous.isNotEmpty()) dpm.setPackagesSuspended(admin, previous.toTypedArray(), false)
-        val toSuspend = allPackages.filter { it !in allowed && it != ctx.packageName }
-        val failed = dpm.setPackagesSuspended(admin, toSuspend.toTypedArray(), true).toSet()
-        store.suspendedPackages = toSuspend.filter { it !in failed }.toSet()
-
-        // 3. Make this app the default Home without asking the user.
-        val home = IntentFilter(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_HOME)
-            addCategory(Intent.CATEGORY_DEFAULT)
-        }
-        dpm.addPersistentPreferredActivity(admin, home, ComponentName(ctx, MainActivity::class.java))
-
-        // 4. Close the real bypass routes an employee could otherwise use:
-        //    - clearing this app's data (would reset the PIN) or uninstalling any app
-        //    - booting into safe mode (third-party launchers, this one included, don't load)
-        //    - factory reset (wipes device-owner status entirely)
-        //    - enabling USB debugging and running `adb shell dpm remove-active-admin`
-        //    - adding a second user profile that isn't managed
+        // Close the real bypass routes an employee could otherwise use:
+        //  - clearing this app's data (would reset the PIN) or uninstalling any app
+        //  - booting into safe mode (loads without this app's blocking policy)
+        //  - factory reset (wipes device-owner status entirely)
+        //  - enabling USB debugging and running `adb shell dpm remove-active-admin`
+        //  - adding a second, unmanaged user profile
         RESTRICTIONS.forEach { dpm.addUserRestriction(admin, it) }
         return true
     }
 
     fun clear(ctx: Context, store: SecureStore) {
         if (!isDeviceOwner(ctx)) return
+        undoPrevious(ctx, store)
+        RESTRICTIONS.forEach { dpm(ctx).clearUserRestriction(admin(ctx), it) }
+    }
+
+    private fun undoPrevious(ctx: Context, store: SecureStore) {
         val dpm = dpm(ctx)
         val admin = admin(ctx)
         val suspended = store.suspendedPackages
         if (suspended.isNotEmpty()) dpm.setPackagesSuspended(admin, suspended.toTypedArray(), false)
         store.suspendedPackages = emptySet()
-        dpm.setLockTaskPackages(admin, emptyArray())
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dpm.setLockTaskFeatures(admin, 0)
-        dpm.clearPackagePersistentPreferredActivities(admin, ctx.packageName)
-        RESTRICTIONS.forEach { dpm.clearUserRestriction(admin, it) }
+        store.hiddenPackages.forEach { dpm.setApplicationHidden(admin, it, false) }
+        store.hiddenPackages = emptySet()
+    }
+
+    /** Gives up device-owner status (useful while testing so the app can be uninstalled). */
+    @Suppress("DEPRECATION")
+    fun releaseDeviceOwner(ctx: Context) {
+        if (isDeviceOwner(ctx)) dpm(ctx).clearDeviceOwnerApp(ctx.packageName)
     }
 
     private val RESTRICTIONS = listOf(
@@ -86,10 +91,4 @@ object PolicyManager {
         UserManager.DISALLOW_DEBUGGING_FEATURES,
         UserManager.DISALLOW_ADD_USER
     )
-
-    /** Gives up device-owner status (useful while testing so the app can be uninstalled). */
-    @Suppress("DEPRECATION")
-    fun releaseDeviceOwner(ctx: Context) {
-        if (isDeviceOwner(ctx)) dpm(ctx).clearDeviceOwnerApp(ctx.packageName)
-    }
 }
