@@ -30,7 +30,16 @@ object PolicyManager {
         // 1. Lock-task (kiosk) whitelist: these packages may run inside the locked task.
         dpm.setLockTaskPackages(admin, (allowed + ctx.packageName).toTypedArray())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_HOME)
+            // Deliberately EXCLUDE HOME and OVERVIEW: pressing Home or opening Recents
+            // must do nothing while pinned, or the lock is cosmetic. Notifications, system
+            // info (clock/battery) and the power menu stay available for normal phone use.
+            dpm.setLockTaskFeatures(
+                admin,
+                DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS or
+                    DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO or
+                    DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS or
+                    DevicePolicyManager.LOCK_TASK_FEATURE_KEYGUARD
+            )
         }
 
         // 2. Suspend everything that is not allowed (greyed out, cannot be launched).
@@ -47,9 +56,13 @@ object PolicyManager {
         }
         dpm.addPersistentPreferredActivity(admin, home, ComponentName(ctx, MainActivity::class.java))
 
-        // 4. Close common bypasses (clearing app data resets the PIN; safe mode disables the launcher).
-        dpm.addUserRestriction(admin, UserManager.DISALLOW_APPS_CONTROL)
-        dpm.addUserRestriction(admin, UserManager.DISALLOW_SAFE_BOOT)
+        // 4. Close the real bypass routes an employee could otherwise use:
+        //    - clearing this app's data (would reset the PIN) or uninstalling any app
+        //    - booting into safe mode (third-party launchers, this one included, don't load)
+        //    - factory reset (wipes device-owner status entirely)
+        //    - enabling USB debugging and running `adb shell dpm remove-active-admin`
+        //    - adding a second user profile that isn't managed
+        RESTRICTIONS.forEach { dpm.addUserRestriction(admin, it) }
         return true
     }
 
@@ -63,9 +76,16 @@ object PolicyManager {
         dpm.setLockTaskPackages(admin, emptyArray())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dpm.setLockTaskFeatures(admin, 0)
         dpm.clearPackagePersistentPreferredActivities(admin, ctx.packageName)
-        dpm.clearUserRestriction(admin, UserManager.DISALLOW_APPS_CONTROL)
-        dpm.clearUserRestriction(admin, UserManager.DISALLOW_SAFE_BOOT)
+        RESTRICTIONS.forEach { dpm.clearUserRestriction(admin, it) }
     }
+
+    private val RESTRICTIONS = listOf(
+        UserManager.DISALLOW_APPS_CONTROL,
+        UserManager.DISALLOW_SAFE_BOOT,
+        UserManager.DISALLOW_FACTORY_RESET,
+        UserManager.DISALLOW_DEBUGGING_FEATURES,
+        UserManager.DISALLOW_ADD_USER
+    )
 
     /** Gives up device-owner status (useful while testing so the app can be uninstalled). */
     @Suppress("DEPRECATION")
