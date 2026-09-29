@@ -1,11 +1,10 @@
 package com.example.applocker
 
-import android.content.ActivityNotFoundException
 import android.app.admin.DevicePolicyManager
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.os.Bundle
 import android.os.SystemClock
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -15,13 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,29 +22,32 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-enum class Screen { SET_PIN, LAUNCHER, ADMIN }
+/**
+ * This app is a settings utility, NOT a launcher. It never takes over the Home screen —
+ * the phone's own launcher (folders, wallpaper, icon layout) is left completely untouched.
+ * Blocking an app means suspending it via DevicePolicyManager: its icon stays exactly where
+ * it is in the real launcher, greyed out, and tapping it fails instead of opening.
+ */
+enum class Screen { SET_PIN, PIN_ENTRY, ADMIN }
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var store: SecureStore
-    private val screen = mutableStateOf(Screen.LAUNCHER)
+    private val screen = mutableStateOf(Screen.PIN_ENTRY)
     private val refreshTick = mutableStateOf(0)
 
-    // Not persisted on purpose: admin access never survives the activity leaving the screen.
-    private var suppressReset = false
     private var failedAttempts = 0
     private var lockedUntil = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = SecureStore(applicationContext)
-        screen.value = if (store.hasPin()) Screen.LAUNCHER else Screen.SET_PIN
+        screen.value = if (store.hasPin()) Screen.PIN_ENTRY else Screen.SET_PIN
 
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
@@ -62,24 +58,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        // Home button pressed while we are the launcher: always fall back to the (locked) grid.
-        if (intent.hasCategory(Intent.CATEGORY_HOME) && store.hasPin()) screen.value = Screen.LAUNCHER
-    }
-
     override fun onResume() {
         super.onResume()
-        suppressReset = false
         refreshTick.value++
     }
 
+    /** Re-lock behind the password every time the app leaves the foreground. */
     override fun onStop() {
         super.onStop()
-        if (!suppressReset && screen.value == Screen.ADMIN) screen.value = Screen.LAUNCHER
+        if (store.hasPin() && screen.value == Screen.ADMIN) screen.value = Screen.PIN_ENTRY
     }
-
-    // ---------------------------------------------------------------- root
 
     @Composable
     private fun AppRoot() {
@@ -88,52 +76,46 @@ class MainActivity : ComponentActivity() {
         val tick by refreshTick
         var restricted by remember { mutableStateOf(store.restricted) }
         var allowed by remember { mutableStateOf(store.allowedPackages) }
+        var blockMode by remember {
+            mutableStateOf(runCatching { PolicyManager.BlockMode.valueOf(store.blockMode) }
+                .getOrDefault(PolicyManager.BlockMode.GREY_OUT))
+        }
         var apps by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
-        var askPin by remember { mutableStateOf(false) }
 
         LaunchedEffect(tick) {
             apps = withContext(Dispatchers.Default) { AppRepository.loadApps(ctx) }
         }
-        // Device owner only: pin the task while the restricted launcher is showing, release it for admin.
-        LaunchedEffect(current, restricted) { setLockTask(current == Screen.LAUNCHER && restricted) }
 
         when (current) {
             Screen.SET_PIN -> {
                 val changing = remember { store.hasPin() }
                 PinSetupScreen(
                     changing = changing,
-                    onSaved = { pin ->
-                        store.setPin(pin)
-                        screen.value = if (changing) Screen.ADMIN else Screen.LAUNCHER
-                    },
+                    onSaved = { pin -> store.setPin(pin); screen.value = Screen.ADMIN },
                     onCancel = { screen.value = Screen.ADMIN }
                 )
             }
 
-            Screen.LAUNCHER -> {
-                val visible = if (restricted) apps.filter { it.pkg in allowed } else apps
-                LauncherScreen(visible, restricted, onAdmin = { askPin = true }, onLaunch = { launchApp(it) })
-                if (askPin) {
-                    PinDialog(
-                        onDismiss = { askPin = false },
-                        onSuccess = { askPin = false; screen.value = Screen.ADMIN }
-                    )
-                }
-            }
+            Screen.PIN_ENTRY -> PinEntryScreen(
+                onSuccess = { screen.value = Screen.ADMIN },
+                onCancel = { finish() }
+            )
 
             Screen.ADMIN -> AdminScreen(
                 apps = apps,
                 refresh = tick,
                 restricted = restricted,
                 allowed = allowed,
+                blockMode = blockMode,
+                onBlockMode = { blockMode = it; store.blockMode = it.name },
                 onRestricted = { restricted = it; store.restricted = it },
                 onToggleApp = { pkg, on ->
                     allowed = if (on) allowed + pkg else allowed - pkg
                     store.allowedPackages = allowed
                 },
                 onChangePin = { screen.value = Screen.SET_PIN },
-                onClose = { screen.value = Screen.LAUNCHER },
-                onApplyPolicy = { applyPolicy(allowed, apps) },
+                onClose = { finish() },
+                onApplyPolicy = { applyPolicy(allowed, apps, blockMode) },
                 onClearPolicy = { clearPolicy() },
                 onReleaseOwner = { PolicyManager.releaseDeviceOwner(this); refreshTick.value++ }
             )
@@ -142,43 +124,24 @@ class MainActivity : ComponentActivity() {
 
     // ---------------------------------------------------------------- actions
 
-    private fun launchApp(pkg: String) {
-        val intent = packageManager.getLaunchIntentForPackage(pkg)
-            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-            ?: return
-        try { startActivity(intent) } catch (e: Exception) { toast("Cannot open this app") }
-    }
-
-    private fun setLockTask(enable: Boolean) {
-        if (!PolicyManager.isDeviceOwner(this) || !PolicyManager.isLockTaskPermitted(this)) return
-        try { if (enable) startLockTask() else stopLockTask() } catch (_: Exception) { }
-    }
-
-    private fun openHomeSettings() {
-        suppressReset = true
-        try { startActivity(Intent(Settings.ACTION_HOME_SETTINGS)) }
-        catch (e: ActivityNotFoundException) { startActivity(Intent(Settings.ACTION_SETTINGS)) }
-    }
-
-    private fun activateDeviceAdmin() {
-        suppressReset = true
-        startActivity(
-            Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
-                .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, AppDeviceAdminReceiver.component(this))
-                .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Lets App Locker apply device policies.")
-        )
-    }
-
-    private fun applyPolicy(allowed: Set<String>, apps: List<AppEntry>) {
+    private fun applyPolicy(allowed: Set<String>, apps: List<AppEntry>, mode: PolicyManager.BlockMode) {
         try {
-            val ok = PolicyManager.apply(this, store, allowed, apps.map { it.pkg })
-            toast(if (ok) "Device-owner policy applied" else "Not device owner - see instructions")
-        } catch (e: SecurityException) { toast("Policy failed: ${e.message}") }
+            val ok = PolicyManager.apply(this, store, allowed, apps.map { it.pkg }, mode)
+            toast(if (ok) "Blocked apps updated" else "Not device owner - see instructions")
+        } catch (e: SecurityException) { toast("Failed: ${e.message}") }
     }
 
     private fun clearPolicy() {
-        try { PolicyManager.clear(this, store); toast("Policy cleared") }
-        catch (e: SecurityException) { toast("Clear failed: ${e.message}") }
+        try { PolicyManager.clear(this, store); toast("All apps unblocked") }
+        catch (e: SecurityException) { toast("Failed: ${e.message}") }
+    }
+
+    private fun activateDeviceAdmin() {
+        startActivity(
+            Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, AppDeviceAdminReceiver.component(this))
+                .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Lets App Locker block apps.")
+        )
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
@@ -198,7 +161,7 @@ class MainActivity : ComponentActivity() {
                 style = MaterialTheme.typography.headlineSmall
             )
             Spacer(Modifier.height(8.dp))
-            Text("Required to open settings or leave restricted mode.")
+            Text("Required every time you reopen this app to change what's blocked.")
             Spacer(Modifier.height(16.dp))
             OutlinedTextField(
                 value = p1, onValueChange = { p1 = it; error = null }, singleLine = true,
@@ -230,28 +193,35 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun PinDialog(onDismiss: () -> Unit, onSuccess: () -> Unit) {
+    private fun PinEntryScreen(onSuccess: () -> Unit, onCancel: () -> Unit) {
         var pin by remember { mutableStateOf("") }
         var error by remember { mutableStateOf<String?>(null) }
-        AlertDialog(
-            onDismissRequest = onDismiss,
-            title = { Text("Admin password") },
-            text = {
-                OutlinedTextField(
-                    value = pin, onValueChange = { pin = it; error = null }, singleLine = true,
-                    label = { Text("Password") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                    isError = error != null,
-                    supportingText = error?.let { msg -> @Composable { Text(msg) } }
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
+        BackHandler(onBack = onCancel)
+
+        Column(
+            Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("App Locker", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(4.dp))
+            Text("Enter the admin password to continue.")
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(
+                value = pin, onValueChange = { pin = it; error = null }, singleLine = true,
+                label = { Text("Password") }, modifier = Modifier.fillMaxWidth(),
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                isError = error != null,
+                supportingText = error?.let { msg -> @Composable { Text(msg) } }
+            )
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
                     val now = SystemClock.elapsedRealtime()
                     if (now < lockedUntil) {
                         error = "Too many attempts. Wait ${(lockedUntil - now) / 1000 + 1}s"
-                        return@TextButton
+                        return@Button
                     }
                     if (store.verifyPin(pin)) {
                         failedAttempts = 0
@@ -262,54 +232,17 @@ class MainActivity : ComponentActivity() {
                         error = "Incorrect password"
                         pin = ""
                     }
-                }) { Text("Unlock") }
-            },
-            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
-        )
-    }
-
-    @Composable
-    private fun LauncherScreen(
-        apps: List<AppEntry>, restricted: Boolean,
-        onAdmin: () -> Unit, onLaunch: (String) -> Unit
-    ) {
-        BackHandler(enabled = true) { /* swallow Back on the home screen */ }
-        Box(Modifier.fillMaxSize()) {
-            if (apps.isEmpty()) {
-                Text(
-                    if (restricted) "No apps allowed yet.\nTap the gear to configure." else "No apps found.",
-                    modifier = Modifier.align(Alignment.Center), textAlign = TextAlign.Center
-                )
-            } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(88.dp),
-                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 64.dp, bottom = 24.dp),
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(apps, key = { it.pkg }) { app ->
-                        Column(
-                            Modifier.clickable { onLaunch(app.pkg) }.padding(8.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Image(app.icon, contentDescription = null, modifier = Modifier.size(56.dp))
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                app.label, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center
-                            )
-                        }
-                    }
-                }
-            }
-            IconButton(onClick = onAdmin, modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)) {
-                Icon(Icons.Default.Settings, contentDescription = "Admin settings")
-            }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Unlock") }
+            TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("Close") }
         }
     }
 
     @Composable
     private fun AdminScreen(
         apps: List<AppEntry>, refresh: Int, restricted: Boolean, allowed: Set<String>,
+        blockMode: PolicyManager.BlockMode, onBlockMode: (PolicyManager.BlockMode) -> Unit,
         onRestricted: (Boolean) -> Unit, onToggleApp: (String, Boolean) -> Unit,
         onChangePin: () -> Unit, onClose: () -> Unit,
         onApplyPolicy: () -> Unit, onClearPolicy: () -> Unit, onReleaseOwner: () -> Unit
@@ -328,20 +261,52 @@ class MainActivity : ComponentActivity() {
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 16.dp)) {
             item {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Admin settings", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    Text("App Locker", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
                     Button(onClick = onClose) { Text("Done") }
                 }
+                Text(
+                    "Blocking an app leaves your home screen exactly as it is; the app's icon " +
+                        "just stops opening. No launcher is changed.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Spacer(Modifier.height(12.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text("Restricted mode", style = MaterialTheme.typography.titleMedium)
-                        Text("ON: home shows only allowed apps. OFF: all apps.", style = MaterialTheme.typography.bodySmall)
+                        Text("Enforce blocking", style = MaterialTheme.typography.titleMedium)
+                        Text("Turn on, then tap \"Block selected apps\" below to apply it.", style = MaterialTheme.typography.bodySmall)
                     }
                     Switch(checked = restricted, onCheckedChange = onRestricted)
                 }
-                Spacer(Modifier.height(8.dp))
-                Button(onClick = { openHomeSettings() }, modifier = Modifier.fillMaxWidth()) { Text("Set as default Home app / switch launcher") }
                 OutlinedButton(onClick = onChangePin, modifier = Modifier.fillMaxWidth()) { Text("Change admin password") }
+                Spacer(Modifier.height(12.dp))
+
+                Text("Blocked apps should:", style = MaterialTheme.typography.titleMedium)
+                Row(
+                    Modifier.fillMaxWidth().clickable { onBlockMode(PolicyManager.BlockMode.GREY_OUT) },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = blockMode == PolicyManager.BlockMode.GREY_OUT,
+                        onClick = { onBlockMode(PolicyManager.BlockMode.GREY_OUT) })
+                    Column {
+                        Text("Grey out")
+                        Text("Icon stays where it is, tapping it fails.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().clickable { onBlockMode(PolicyManager.BlockMode.HIDE) },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    RadioButton(selected = blockMode == PolicyManager.BlockMode.HIDE,
+                        onClick = { onBlockMode(PolicyManager.BlockMode.HIDE) })
+                    Column {
+                        Text("Hide completely")
+                        Text("Icon disappears from the launcher, as if uninstalled.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                Text(
+                    "Changing this and tapping \"Block selected apps\" again switches every blocked app to the new mode.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(12.dp))
@@ -350,20 +315,19 @@ class MainActivity : ComponentActivity() {
                 Text("Device admin: ${if (isAdmin) "active" else "inactive"}  |  Device owner: ${if (isOwner) "yes" else "no"}",
                     style = MaterialTheme.typography.bodySmall)
                 if (!isOwner) {
-                    Text("Without device-owner status this only hides apps behind the launcher — " +
-                        "it can be undone from Settings. Provision with:\n" +
+                    Text("Blocking needs device-owner status. Provision with:\n" +
                         "adb shell dpm set-device-owner ${ctx.packageName}/.AppDeviceAdminReceiver\n" +
                         "on a factory-reset phone with no Google account added yet, before handing it to the employee.",
                         style = MaterialTheme.typography.bodySmall)
                 } else {
                     Text("Device owner is active: uninstalling this app, factory reset, safe mode, USB " +
-                        "debugging removal and adding a second user are all blocked once you apply the policy below.",
+                        "debugging removal and adding a second user are all blocked once you tap Block selected apps.",
                         style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = { activateDeviceAdmin() }, enabled = !isAdmin, modifier = Modifier.fillMaxWidth()) { Text("Activate device admin") }
-                Button(onClick = onApplyPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Lock device to allowed apps") }
-                OutlinedButton(onClick = onClearPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Unlock (clear policy, keep device owner)") }
+                Button(onClick = onApplyPolicy, enabled = isOwner && restricted, modifier = Modifier.fillMaxWidth()) { Text("Block selected apps") }
+                OutlinedButton(onClick = onClearPolicy, enabled = isOwner, modifier = Modifier.fillMaxWidth()) { Text("Unblock all apps") }
                 OutlinedButton(
                     onClick = { showReleaseConfirm = true }, enabled = isOwner,
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
@@ -388,7 +352,9 @@ class MainActivity : ComponentActivity() {
                 HorizontalDivider()
                 Spacer(Modifier.height(12.dp))
 
-                Text("Allowed apps (${allowed.size})", style = MaterialTheme.typography.titleMedium)
+                Text("Blocked apps (${allowed.let { apps.size - it.size - 1 }.coerceAtLeast(0)} of ${apps.size})",
+                    style = MaterialTheme.typography.titleMedium)
+                Text("Tick the apps to ALLOW. Everything left unticked gets blocked.", style = MaterialTheme.typography.bodySmall)
                 OutlinedTextField(
                     value = query, onValueChange = { query = it }, singleLine = true,
                     label = { Text("Search apps") }, modifier = Modifier.fillMaxWidth()
