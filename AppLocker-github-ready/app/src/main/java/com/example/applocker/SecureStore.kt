@@ -48,6 +48,16 @@ class SecureStore(context: Context) {
         get() = HashSet(prefs.getStringSet(KEY_SUSPENDED, emptySet()) ?: emptySet())
         set(v) { prefs.edit().putStringSet(KEY_SUSPENDED, HashSet(v)).apply() }
 
+    /** Packages we hid (setApplicationHidden) through DevicePolicyManager, so we can un-hide them later. */
+    var hiddenPackages: Set<String>
+        get() = HashSet(prefs.getStringSet(KEY_HIDDEN, emptySet()) ?: emptySet())
+        set(v) { prefs.edit().putStringSet(KEY_HIDDEN, HashSet(v)).apply() }
+
+    /** "GREY_OUT" or "HIDE" — see PolicyManager.BlockMode. */
+    var blockMode: String
+        get() = prefs.getString(KEY_BLOCK_MODE, "GREY_OUT") ?: "GREY_OUT"
+        set(v) { prefs.edit().putString(KEY_BLOCK_MODE, v).apply() }
+
     private fun derive(pin: String, salt: ByteArray): ByteArray {
         val spec = PBEKeySpec(pin.toCharArray(), salt, 120_000, 256)
         return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
@@ -59,6 +69,8 @@ class SecureStore(context: Context) {
         const val KEY_RESTRICTED = "restricted"
         const val KEY_ALLOWED = "allowed_packages"
         const val KEY_SUSPENDED = "suspended_packages"
+        const val KEY_HIDDEN = "hidden_packages"
+        const val KEY_BLOCK_MODE = "block_mode"
 
         fun createPrefs(ctx: Context): SharedPreferences = try {
             val key = MasterKey.Builder(ctx).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
