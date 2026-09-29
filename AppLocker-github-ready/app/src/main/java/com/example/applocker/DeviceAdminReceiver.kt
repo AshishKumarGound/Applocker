@@ -42,7 +42,9 @@ class BootReceiver : BroadcastReceiver() {
         val store = SecureStore(context)
         if (store.restricted && PolicyManager.isDeviceOwner(context)) {
             try {
-                PolicyManager.apply(context, store, store.allowedPackages, AppRepository.launchablePackages(context))
+                val mode = runCatching { PolicyManager.BlockMode.valueOf(store.blockMode) }
+                    .getOrDefault(PolicyManager.BlockMode.GREY_OUT)
+                PolicyManager.apply(context, store, store.allowedPackages, AppRepository.launchablePackages(context), mode)
             } catch (e: Exception) {
                 Log.w("BootReceiver", "Could not re-apply policy", e)
             }
